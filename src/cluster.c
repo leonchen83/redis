@@ -2120,7 +2120,7 @@ void clusterWriteHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     nwritten = write(fd, link->sndbuf, sdslen(link->sndbuf));
     if (nwritten <= 0) {
         serverLog(LL_DEBUG,"I/O error writing to node link: %s",
-            strerror(errno));
+            (nwritten == -1) ? strerror(errno) : "short write");
         handleLinkIOError(link);
         return;
     }
@@ -2377,7 +2377,7 @@ void clusterSendPing(clusterLink *link, int type) {
      * same time.
      *
      * Since we have non-voting slaves that lower the probability of an entry
-     * to feature our node, we set the number of entires per packet as
+     * to feature our node, we set the number of entries per packet as
      * 10% of the total nodes we have. */
     wanted = floor(dictSize(server.cluster->nodes)/10);
     if (wanted < 3) wanted = 3;

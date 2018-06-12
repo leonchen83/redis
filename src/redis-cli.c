@@ -1075,6 +1075,8 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
     if (!strcasecmp(command,"info") ||
         (argc >= 2 && !strcasecmp(command,"debug") &&
                        !strcasecmp(argv[1],"htstats")) ||
+        (argc >= 2 && !strcasecmp(command,"debug") &&
+                       !strcasecmp(argv[1],"htstats-key")) ||
         (argc >= 2 && !strcasecmp(command,"memory") &&
                       (!strcasecmp(argv[1],"malloc-stats") ||
                        !strcasecmp(argv[1],"doctor"))) ||
@@ -3088,7 +3090,7 @@ static int clusterManagerNodeLoadInfo(clusterManagerNode *node, int opts,
                 currentNode->flags |= CLUSTER_MANAGER_FLAG_FAIL;
             else if (strcmp(flag, "slave") == 0) {
                 currentNode->flags |= CLUSTER_MANAGER_FLAG_SLAVE;
-                if (master_id == 0) {
+                if (master_id != NULL) {
                     if (currentNode->replicate) sdsfree(currentNode->replicate);
                     currentNode->replicate = sdsnew(master_id);
                 }
@@ -5091,7 +5093,7 @@ static int clusterManagerCommandImport(int argc, char **argv) {
 
     // Build a slot -> node map
     clusterManagerNode  *slots_map[CLUSTER_MANAGER_SLOTS];
-    memset(slots_map, 0, sizeof(slots_map) / sizeof(clusterManagerNode *));
+    memset(slots_map, 0, sizeof(slots_map));
     listIter li;
     listNode *ln;
     for (i = 0; i < CLUSTER_MANAGER_SLOTS; i++) {
@@ -5575,7 +5577,7 @@ static void getRDB(void) {
         nwritten = write(fd, buf, nread);
         if (nwritten != nread) {
             fprintf(stderr,"Error writing data to file: %s\n",
-                strerror(errno));
+                (nwritten == -1) ? strerror(errno) : "short write");
             exit(1);
         }
         payload -= nread;

@@ -845,13 +845,14 @@ int clientsCronResizeQueryBuffer(client *c) {
 
     /* There are two conditions to resize the query buffer:
      * 1) Query buffer is > BIG_ARG and too big for latest peak.
-     * 2) Client is inactive and the buffer is bigger than 1k. */
-    if (((querybuf_size > PROTO_MBULK_BIG_ARG) &&
-         (querybuf_size/(c->querybuf_peak+1)) > 2) ||
-         (querybuf_size > 1024 && idletime > 2))
+     * 2) Query buffer is > BIG_ARG and client is idle. */
+    if (querybuf_size > PROTO_MBULK_BIG_ARG &&
+         ((querybuf_size/(c->querybuf_peak+1)) > 2 ||
+          idletime > 2))
     {
-        /* Only resize the query buffer if it is actually wasting space. */
-        if (sdsavail(c->querybuf) > 1024) {
+        /* Only resize the query buffer if it is actually wasting
+         * at least a few kbytes. */
+        if (sdsavail(c->querybuf) > 1024*4) {
             c->querybuf = sdsRemoveFreeSpace(c->querybuf);
         }
     }
@@ -1485,6 +1486,8 @@ void initServerConfig(void) {
     server.zset_max_ziplist_entries = OBJ_ZSET_MAX_ZIPLIST_ENTRIES;
     server.zset_max_ziplist_value = OBJ_ZSET_MAX_ZIPLIST_VALUE;
     server.hll_sparse_max_bytes = CONFIG_DEFAULT_HLL_SPARSE_MAX_BYTES;
+    server.stream_node_max_bytes = OBJ_STREAM_NODE_MAX_BYTES;
+    server.stream_node_max_entries = OBJ_STREAM_NODE_MAX_ENTRIES;
     server.shutdown_asap = 0;
     server.cluster_enabled = 0;
     server.cluster_node_timeout = CLUSTER_DEFAULT_NODE_TIMEOUT;

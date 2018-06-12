@@ -41,6 +41,7 @@
 #define STREAM_ITEM_FLAG_SAMEFIELDS (1<<1)  /* Same fields as master entry. */
 
 void streamFreeCG(streamCG *cg);
+void streamFreeNACK(streamNACK *na);
 size_t streamReplyWithRangeFromConsumerPEL(client *c, stream *s, streamID *start, streamID *end, size_t count, streamConsumer *consumer);
 
 /* -----------------------------------------------------------------------
@@ -221,7 +222,7 @@ int streamAppendItem(stream *s, robj **argv, int numfields, streamID *added_id, 
      * +-------+---------+------------+---------+--/--+---------+---------+-+
      *
      * count and deleted just represent respectively the total number of
-     * entires inside the listpack that are valid, and marked as deleted
+     * entries inside the listpack that are valid, and marked as deleted
      * (delted flag in the entry flags set). So the total number of items
      * actually inside the listpack (both deleted and not) is count+deleted.
      *
@@ -234,10 +235,24 @@ int streamAppendItem(stream *s, robj **argv, int numfields, streamID *added_id, 
      *
      * The "0" entry at the end is the same as the 'lp-count' entry in the
      * regular stream entries (see below), and marks the fact that there are
-     * no more entires, when we scan the stream from right to left. */
+     * no more entries, when we scan the stream from right to left. */
+
+    /* First of all, check if we can append to the current macro node or
+     * if we need to switch to the next one. 'lp' will be set to NULL if
+     * the current node is full. */
+    if (lp != NULL) {
+        if (server.stream_node_max_bytes &&
+            lp_bytes > server.stream_node_max_bytes)
+        {
+            lp = NULL;
+        } else if (server.stream_node_max_entries) {
+            int64_t count = lpGetInteger(lpFirst(lp));
+            if (count > server.stream_node_max_entries) lp = NULL;
+        }
+    }
 
     int flags = STREAM_ITEM_FLAG_NONE;
-    if (lp == NULL || lp_bytes > STREAM_BYTES_PER_LISTPACK) {
+    if (lp == NULL || lp_bytes > server.stream_node_max_bytes) {
         master_id = id;
         streamEncodeID(rax_key,&id);
         /* Create the listpack having the master entry ID and fields. */
@@ -690,6 +705,9 @@ void streamIteratorRemoveEntry(streamIterator *si, streamID *current) {
     aux = lpGetInteger(p);
     lp = lpReplaceInteger(lp,&p,aux+1);
 
+    /* Update the number of entries counter. */
+    si->stream->length--;
+
     /* Re-seek the iterator to fix the now messed up state. */
     streamID start, end;
     if (si->rev) {
@@ -814,7 +832,7 @@ void streamPropagateXCLAIM(client *c, robj *key, robj *group, robj *id, streamNA
  * Note that this function is recursive in certian cases. When it's called
  * with a non NULL group and consumer argument, it may call
  * streamReplyWithRangeFromConsumerPEL() in order to get entries from the
- * consumer pending entires list. However such a function will then call
+ * consumer pending entries list. However such a function will then call
  * streamReplyWithRange() in order to emit single entries (found in the
  * PEL by ID) to the client. This is the use case for the STREAM_RWR_RAWENTRIES
  * flag.
@@ -867,18 +885,41 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
 
         /* If a group is passed, we need to create an entry in the
          * PEL (pending entries list) of this group *and* this consumer.
-         * Note that we are sure about the fact the message is not already
-         * associated with some other consumer, because if we reached this
-         * loop the IDs the user is requesting are greater than any message
-         * delivered for this group. */
+         *
+         * Note that we cannot be sure about the fact the message is not
+         * already owned by another consumer, because the admin is able
+         * to change the consumer group last delivered ID using the
+         * XGROUP SETID command. So if we find that there is already
+         * a NACK for the entry, we need to associate it to the new
+         * consumer. */
         if (group && !(flags & STREAM_RWR_NOACK)) {
             unsigned char buf[sizeof(streamID)];
             streamEncodeID(buf,&id);
+
+            /* Try to add a new NACK. Most of the time this will work and
+             * will not require extra lookups. We'll fix the problem later
+             * if we find that there is already a entry for this ID. */
             streamNACK *nack = streamCreateNACK(consumer);
             int retval = 0;
-            retval += raxInsert(group->pel,buf,sizeof(buf),nack,NULL);
-            retval += raxInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
-            serverAssert(retval == 2); /* Make sure entry was inserted. */
+            retval += raxTryInsert(group->pel,buf,sizeof(buf),nack,NULL);
+            retval += raxTryInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
+
+            /* Now we can check if the entry was already busy, and
+             * in that case reassign the entry to the new consumer. */
+            if (retval == 0) {
+                streamFreeNACK(nack);
+                nack = raxFind(group->pel,buf,sizeof(buf));
+                serverAssert(nack != raxNotFound);
+                raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
+                /* Update the consumer and idle time. */
+                nack->consumer = consumer;
+                nack->delivery_time = mstime();
+                nack->delivery_count++;
+                /* Add the entry in the new consumer local PEL. */
+                raxInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
+            } else if (retval == 1) {
+                serverPanic("NACK half-created. Should not be possible.");
+            }
 
             /* Propagate as XCLAIM. */
             if (spi) {
@@ -1269,14 +1310,13 @@ void xreadCommand(client *c) {
          * starting from now. */
         int id_idx = i - streams_arg - streams_count;
         robj *key = c->argv[i-streams_count];
-        robj *o;
+        robj *o = lookupKeyRead(c->db,key);
+        if (o && checkType(c,o,OBJ_STREAM)) goto cleanup;
         streamCG *group = NULL;
 
         /* If a group was specified, than we need to be sure that the
          * key and group actually exist. */
         if (groupname) {
-            o = lookupKeyRead(c->db,key);
-            if (o && checkType(c,o,OBJ_STREAM)) goto cleanup;
             if (o == NULL ||
                 (group = streamLookupCG(o->ptr,groupname->ptr)) == NULL)
             {
@@ -1290,8 +1330,6 @@ void xreadCommand(client *c) {
         }
 
         if (strcmp(c->argv[i]->ptr,"$") == 0) {
-            o = lookupKeyRead(c->db,key);
-            if (o && checkType(c,o,OBJ_STREAM)) goto cleanup;
             if (o) {
                 stream *s = o->ptr;
                 ids[id_idx] = s->last_id;
@@ -1535,14 +1573,13 @@ NULL
     /* Lookup the key now, this is common for all the subcommands but HELP. */
     if (c->argc >= 4) {
         robj *o = lookupKeyWriteOrReply(c,c->argv[2],shared.nokeyerr);
-        if (o == NULL) return;
+        if (o == NULL || checkType(c,o,OBJ_STREAM)) return;
         s = o->ptr;
         grpname = c->argv[3]->ptr;
 
         /* Certain subcommands require the group to exist. */
         if ((cg = streamLookupCG(s,grpname)) == NULL &&
             (!strcasecmp(opt,"SETID") ||
-             !strcasecmp(opt,"DELGROUP") ||
              !strcasecmp(opt,"DELCONSUMER")))
         {
             addReplyErrorFormat(c, "-NOGROUP No such consumer group '%s' "
@@ -1569,7 +1606,22 @@ NULL
                 sdsnew("-BUSYGROUP Consumer Group name already exists\r\n"));
         }
     } else if (!strcasecmp(opt,"SETID") && c->argc == 5) {
-    } else if (!strcasecmp(opt,"DELGROUP") && c->argc == 4) {
+        streamID id;
+        if (!strcmp(c->argv[4]->ptr,"$")) {
+            id = s->last_id;
+        } else if (streamParseIDOrReply(c,c->argv[4],&id,0) != C_OK) {
+            return;
+        }
+        cg->last_id = id;
+        addReply(c,shared.ok);
+    } else if (!strcasecmp(opt,"DESTROY") && c->argc == 4) {
+        if (cg) {
+            raxRemove(s->cgroups,(unsigned char*)grpname,sdslen(grpname),NULL);
+            streamFreeCG(cg);
+            addReply(c,shared.cone);
+        } else {
+            addReply(c,shared.czero);
+        }
     } else if (!strcasecmp(opt,"DELCONSUMER") && c->argc == 5) {
         /* Delete the consumer and returns the number of pending messages
          * that were yet associated with such a consumer. */
@@ -1728,8 +1780,10 @@ void xpendingCommand(client *c) {
 
         /* If a consumer name was mentioned but it does not exist, we can
          * just return an empty array. */
-        if (consumername && consumer == NULL)
+        if (consumername && consumer == NULL) {
             addReplyMultiBulkLen(c,0);
+            return;
+        }
 
         rax *pel = consumer ? consumer->pel : group->pel;
         unsigned char startkey[sizeof(streamID)];
@@ -1785,7 +1839,7 @@ void xpendingCommand(client *c) {
  * becomes the specified <consumer>. If the minimum idle time specified
  * is zero, messages are claimed regardless of their idle time.
  *
- * All the messages that cannot be found inside the pending entires list
+ * All the messages that cannot be found inside the pending entries list
  * are ignored, but in case the FORCE option is used. In that case we
  * create the NACK (representing a not yet acknowledged message) entry in
  * the consumer group PEL.
@@ -1970,7 +2024,7 @@ void xclaimCommand(client *c) {
             nack->delivery_time = deliverytime;
             /* Set the delivery attempts counter if given. */
             if (retrycount >= 0) nack->delivery_count = retrycount;
-            /* Add the entry in the new cosnumer local PEL. */
+            /* Add the entry in the new consumer local PEL. */
             raxInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
             /* Send the reply for this entry. */
             if (justid) {
@@ -1999,7 +2053,7 @@ void xclaimCommand(client *c) {
 void xdelCommand(client *c) {
     robj *o;
 
-    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL
+    if ((o = lookupKeyWriteOrReply(c,c->argv[1],shared.czero)) == NULL
         || checkType(c,o,OBJ_STREAM)) return;
     stream *s = o->ptr;
 
@@ -2040,7 +2094,7 @@ void xtrimCommand(client *c) {
 
     /* If the key does not exist, we are ok returning zero, that is, the
      * number of elements removed from the stream. */
-    if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL
+    if ((o = lookupKeyWriteOrReply(c,c->argv[1],shared.czero)) == NULL
         || checkType(c,o,OBJ_STREAM)) return;
     stream *s = o->ptr;
 
@@ -2093,14 +2147,12 @@ void xtrimCommand(client *c) {
 /* XINFO CONSUMERS key group
  * XINFO GROUPS <key>
  * XINFO STREAM <key>
- * XINFO <key> (alias of XINFO STREAM key)
  * XINFO HELP. */
 void xinfoCommand(client *c) {
     const char *help[] = {
 "CONSUMERS <key> <groupname>  -- Show consumer groups of group <groupname>.",
 "GROUPS <key>                 -- Show the stream consumer groups.",
 "STREAM <key>                 -- Show information about the stream.",
-"<key>                        -- Alias for STREAM <key>.",
 "HELP                         -- Print this help.",
 NULL
     };
@@ -2112,20 +2164,19 @@ NULL
     if (!strcasecmp(c->argv[1]->ptr,"HELP")) {
         addReplyHelp(c, help);
         return;
+    } else if (c->argc < 3) {
+        addReplyError(c,"syntax error, try 'XINFO HELP'");
+        return;
     }
 
-    /* Handle the fact that no subcommand means "STREAM". */
-    if (c->argc == 2) {
-        opt = "STREAM";
-        key = c->argv[1];
-    } else {
-        opt = c->argv[1]->ptr;
-        key = c->argv[2];
-    }
+    /* With the exception of HELP handled before any other sub commands, all
+     * the ones are in the form of "<subcommand> <key>". */
+    opt = c->argv[1]->ptr;
+    key = c->argv[2];
 
     /* Lookup the key now, this is common for all the subcommands but HELP. */
     robj *o = lookupKeyWriteOrReply(c,key,shared.nokeyerr);
-    if (o == NULL) return;
+    if (o == NULL || checkType(c,o,OBJ_STREAM)) return;
     s = o->ptr;
 
     /* Dispatch the different subcommands. */
@@ -2180,9 +2231,7 @@ NULL
             addReplyLongLong(c,raxSize(cg->pel));
         }
         raxStop(&ri);
-    } else if (c->argc == 2 ||
-               (!strcasecmp(opt,"STREAM") && c->argc == 3))
-    {
+    } else if (!strcasecmp(opt,"STREAM") && c->argc == 3) {
         /* XINFO STREAM <key> (or the alias XINFO <key>). */
         addReplyMultiBulkLen(c,12);
         addReplyStatus(c,"length");

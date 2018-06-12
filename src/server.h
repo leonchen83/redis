@@ -339,7 +339,7 @@ typedef long long mstime_t; /* millisecond time type. */
 /* Anti-warning macro... */
 #define UNUSED(V) ((void) V)
 
-#define ZSKIPLIST_MAXLEVEL 32 /* Should be enough for 2^32 elements */
+#define ZSKIPLIST_MAXLEVEL 64 /* Should be enough for 2^64 elements */
 #define ZSKIPLIST_P 0.25      /* Skiplist P = 1/4 */
 
 /* Append only defines */
@@ -348,12 +348,14 @@ typedef long long mstime_t; /* millisecond time type. */
 #define AOF_FSYNC_EVERYSEC 2
 #define CONFIG_DEFAULT_AOF_FSYNC AOF_FSYNC_EVERYSEC
 
-/* Zip structure related defaults */
+/* Zipped structures related defaults */
 #define OBJ_HASH_MAX_ZIPLIST_ENTRIES 512
 #define OBJ_HASH_MAX_ZIPLIST_VALUE 64
 #define OBJ_SET_MAX_INTSET_ENTRIES 512
 #define OBJ_ZSET_MAX_ZIPLIST_ENTRIES 128
 #define OBJ_ZSET_MAX_ZIPLIST_VALUE 64
+#define OBJ_STREAM_NODE_MAX_BYTES 4096
+#define OBJ_STREAM_NODE_MAX_ENTRIES 100
 
 /* List defaults */
 #define OBJ_LIST_MAX_ZIPLIST_SIZE -2
@@ -780,7 +782,7 @@ typedef struct zskiplistNode {
     struct zskiplistNode *backward;
     struct zskiplistLevel {
         struct zskiplistNode *forward;
-        unsigned int span;
+        unsigned long span;
     } level[];
 } zskiplistNode;
 
@@ -1177,6 +1179,8 @@ struct redisServer {
     size_t zset_max_ziplist_entries;
     size_t zset_max_ziplist_value;
     size_t hll_sparse_max_bytes;
+    size_t stream_node_max_bytes;
+    int64_t stream_node_max_entries;
     /* List parameters */
     int list_max_ziplist_size;
     int list_compress_depth;
@@ -1624,7 +1628,7 @@ void zzlNext(unsigned char *zl, unsigned char **eptr, unsigned char **sptr);
 void zzlPrev(unsigned char *zl, unsigned char **eptr, unsigned char **sptr);
 unsigned char *zzlFirstInRange(unsigned char *zl, zrangespec *range);
 unsigned char *zzlLastInRange(unsigned char *zl, zrangespec *range);
-unsigned int zsetLength(const robj *zobj);
+unsigned long zsetLength(const robj *zobj);
 void zsetConvert(robj *zobj, int encoding);
 void zsetConvertToZiplistIfNeeded(robj *zobj, size_t maxelelen);
 int zsetScore(robj *zobj, sds member, double *score);
