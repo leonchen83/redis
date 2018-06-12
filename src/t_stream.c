@@ -1554,13 +1554,13 @@ uint64_t streamDelConsumer(streamCG *cg, sds name) {
 
 /* XGROUP CREATE <key> <groupname> <id or $>
  * XGROUP SETID <key> <id or $>
- * XGROUP DELGROUP <key> <groupname>
+ * XGROUP DESTROY <key> <groupname>
  * XGROUP DELCONSUMER <key> <groupname> <consumername> */
 void xgroupCommand(client *c) {
     const char *help[] = {
 "CREATE      <key> <groupname> <id or $>  -- Create a new consumer group.",
 "SETID       <key> <groupname> <id or $>  -- Set the current group ID.",
-"DELGROUP    <key> <groupname>            -- Remove the specified group.",
+"DESTROY    <key> <groupname>            -- Remove the specified group.",
 "DELCONSUMER <key> <groupname> <consumer> -- Remove the specified conusmer.",
 "HELP                                     -- Prints this help.",
 NULL
@@ -1614,11 +1614,13 @@ NULL
         }
         cg->last_id = id;
         addReply(c,shared.ok);
+        server.dirty++;
     } else if (!strcasecmp(opt,"DESTROY") && c->argc == 4) {
         if (cg) {
             raxRemove(s->cgroups,(unsigned char*)grpname,sdslen(grpname),NULL);
             streamFreeCG(cg);
             addReply(c,shared.cone);
+            server.dirty++;
         } else {
             addReply(c,shared.czero);
         }
